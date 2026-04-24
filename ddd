@@ -6,12 +6,6 @@ $env:POWERCLI_SKIP_REENTRANT_SERVER_LIST = "1"
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# ============================================================
-# Failure reason constants
-# ============================================================
-$FAIL_UNREACHABLE = "UNREACHABLE"
-$FAIL_SKIPPED_BY_USER = "SKIPPED_BY_USER"
-
 function Read-CredentialInteractive {
     param(
         [string]$TargetName
@@ -154,19 +148,21 @@ function Connect-EsxiDirect {
         [string]$HostName
     )
 
-    # 优先使用成功缓存凭证
+    # 使用本地副本，避免污染全局变量
+    $localPool = $CredentialPool
+
     if ($SuccessCredentialMap[$HostName]) {
-        $CredentialPool = @($SuccessCredentialMap[$HostName]) + $CredentialPool
+        $localPool = @($SuccessCredentialMap[$HostName]) + $CredentialPool
     }
 
-    foreach ($cred in $CredentialPool) {
+    foreach ($cred in $localPool) {
         try {
             $connection = Connect-VIServer `
                 -Server $HostName `
                 -Credential $cred `
                 -ErrorAction Stop
 
-            $vmHost = Get-VMHost -Server $connection | Select-Object -First 1
+            $vmHost = Get-VMHost -Server $connection
 
             # 记录成功凭证
             $SuccessCredentialMap[$HostName] = $cred
@@ -314,10 +310,8 @@ $nicSortDefinition = @(
 Write-Host "Phase 1: Fast connectivity scan..." -ForegroundColor Cyan
 
 $preCheckMap = @{}
-$throttle = 20
 
-$esxiHostNames | ForEach-Object -Parallel {
-    param($hostName)
+foreach ($hostName in $esxiHostNames) {
 
     try {
         $client = New-Object System.Net.Sockets.TcpClient
@@ -330,15 +324,8 @@ $esxiHostNames | ForEach-Object -Parallel {
         $ok = $false
     }
 
-    [PSCustomObject]@{
-        Host  = $hostName
-        TcpOk = $ok
-    }
-
-} -ThrottleLimit $throttle | ForEach-Object {
-    $preCheckMap[$_.Host] = $_.TcpOk
+    $preCheckMap[$hostName.ToLower()] = $ok
 }
-
 foreach ($inputHostName in $esxiHostNames) {
     $hostTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -352,7 +339,7 @@ foreach ($inputHostName in $esxiHostNames) {
         # ============================================================
         # ① PreCheck FIRST（避免无效 vCenter 查询）
         # ============================================================
-        if (-not $preCheckMap[$inputHostName]) {
+        if (-not $preCheckMap[$inputHostName.ToLower()]) {
 
             Write-Host "TCP 443 unreachable → skip" -ForegroundColor DarkYellow
 
@@ -381,6 +368,29 @@ foreach ($inputHostName in $esxiHostNames) {
                 }
             }
         }
+
+        # ============================================================
+        # ③ NOT in vCenter → Direct
+        # ============================================================
+        if (-not $hostContext) {
+
+            Write-Host "Not found in vCenter → Direct connect" -ForegroundColor Yellow
+
+            $hostContext = Connect-EsxiDirect $inputHostName
+
+            if (-not $hostContext -or -not $hostContext.Success) {
+
+                Write-Host "Direct connection failed" -ForegroundColor Red
+
+                Write-Status `
+                    -HostName $inputHostName `
+                    -Mode "Direct" `
+                    -Result "FAILED"
+
+                continue
+            }
+        }
+
         # ============================================================
         # ③ At this point, VMHost is guaranteed
         # ============================================================
