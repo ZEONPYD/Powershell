@@ -17,7 +17,7 @@ function Read-CredentialInteractive {
     $username = Read-Host "Username"
     $password = Read-Host "Password" -AsSecureString
 
-    if (-not $username -or -not $password) {
+    if ([string]::IsNullOrWhiteSpace($username) -or $password.Length -eq 0) {
         return $null
     }
     return New-Object PSCredential ($username, $password)
@@ -38,10 +38,6 @@ if ($vCenterServer) {
     Write-Host "      These credentials are required to support phased data collection and to minimize repeated authentication prompts during execution." -ForegroundColor Yellow
     $vCenterCredential = Read-CredentialInteractive "vCenter"
 }
-
-# ============================================================
-# Cache ESXi Direct credential at startup (optional later use)
-# ============================================================
 
 # ============================================================
 # Credential Pool (Interactive, secure, no hardcode)
@@ -114,11 +110,11 @@ if ($vCenterServer) {
             -Credential $vCenterCredential `
             -ErrorAction Stop
         Write-Host ("[SUCCESS] Connected to vCenter: {0}" -f $vcConnection.Name) -ForegroundColor Green
-        $script:vcDnsDomain = ($vcConnection.Name -split '\.', 2)[1]
+        $parts = $vcConnection.Name -split '\.', 2
+        $script:vcDnsDomain = if ($parts.Count -gt 1) { $parts[1] } else { $null }
     }
     catch {
-        Write-Host ("[INFO] vCenter connection to '{0}' failed. ESXi Direct mode will be used." -f $vCenterServer
-        ) -ForegroundColor DarkYellow
+        Write-Host ("[INFO] vCenter connection to '{0}' failed. ESXi Direct mode will be used." -f $vCenterServer) -ForegroundColor DarkYellow
     }
 }
 else {
@@ -127,14 +123,71 @@ else {
 
 $vmHostMap = @{}
 
+# ============================================================
+# PropertyCollector INIT (FIXED VERSION)
+# ============================================================
+
+$pc = Get-View $vcConnection.ExtensionData.Content.PropertyCollector
+
+# 从 RootFolder -> Datacenter -> HostFolder -> ComputeResource -> HostSystem
+$rootFolder = Get-View $vcConnection.ExtensionData.Content.RootFolder
+
+$propSpec = New-Object VMware.Vim.PropertySpec
+$propSpec.Type = "HostSystem"
+$propSpec.PathSet = @("name", "runtime.connectionState", "config.network", "summary.runtime")
+
+$objectSpec = New-Object VMware.Vim.ObjectSpec
+$objectSpec.Obj = $rootFolder
+$objectSpec.Skip = $true
+
+$folderTraversal = New-Object VMware.Vim.TraversalSpec
+$folderTraversal.Name = "FolderToChild"
+$folderTraversal.Type = "Folder"
+$folderTraversal.Path = "childEntity"
+$folderTraversal.Skip = $false
+
+$dcTraversal = New-Object VMware.Vim.TraversalSpec
+$dcTraversal.Name = "DatacenterToHostFolder"
+$dcTraversal.Type = "Datacenter"
+$dcTraversal.Path = "hostFolder"
+$dcTraversal.Skip = $false
+
+$crTraversal = New-Object VMware.Vim.TraversalSpec
+$crTraversal.Name = "ComputeToHost"
+$crTraversal.Type = "ComputeResource"
+$crTraversal.Path = "host"
+$crTraversal.Skip = $false
+
+$clusterTraversal = New-Object VMware.Vim.TraversalSpec
+$clusterTraversal.Name = "ClusterToHost"
+$clusterTraversal.Type = "ClusterComputeResource"
+$clusterTraversal.Path = "host"
+$clusterTraversal.Skip = $false
+
+# 关键：递归链
+$folderTraversal.SelectSet = @($folderTraversal, $dcTraversal, $crTraversal, $clusterTraversal)
+$dcTraversal.SelectSet = @($folderTraversal, $crTraversal, $clusterTraversal)
+$crTraversal.SelectSet = @()
+$clusterTraversal.SelectSet = @()
+
+$objectSpec.SelectSet = @($folderTraversal)
+
+$filterSpec = New-Object VMware.Vim.PropertyFilterSpec
+$filterSpec.ObjectSet = @($objectSpec)
+$filterSpec.PropSet = @($propSpec)
+
+$pcData = $pc.RetrieveProperties($filterSpec)
+
 if ($vcConnection) {
     Write-Host ""
     Write-Host "Caching vCenter inventory..." -ForegroundColor Gray -NoNewline
+    $vmHostMap = @{}
 
-    $allHosts = Get-VMHost -Server $vcConnection
+    foreach ($item in $pcData) {
 
-    foreach ($h in $allHosts) {
-        $vmHostMap[$h.Name.ToLower()] = $h
+        if ($item.Obj -and $item.Obj.Name) {
+            $vmHostMap[$item.Properties[0].Value.ToLower()] = $item.Obj
+        }
     }
 }
 
@@ -182,32 +235,6 @@ function Connect-EsxiDirect {
     return [pscustomobject]@{
         Success = $false
         Reason  = "AUTH_FAILED"
-    }
-}
-# ============================================================
-# Pre-connectivity check for ESXi host
-# ============================================================
-function Test-EsxiFast {
-    param(
-        [string]$HostName,
-        [int]$TimeoutMs = 1200
-    )
-
-    try {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $iar = $client.BeginConnect($HostName, 443, $null, $null)
-
-        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
-            $client.Close()
-            return $false
-        }
-
-        $client.EndConnect($iar)
-        $client.Close()
-        return $true
-    }
-    catch {
-        return $false
     }
 }
 
@@ -303,6 +330,8 @@ $nicSortDefinition = @(
 
 $preCheckMap = @{}
 
+$csvBuffer = New-Object System.Collections.Generic.List[string]
+
 foreach ($hostName in $esxiHostNames) {
 
     try {
@@ -325,6 +354,61 @@ Write-Host "============================================================" -Foreg
 
 $esxiCount = $esxiHostNames.Count
 $i = 0
+# ============================================================
+# dvSwitch Reverse Index Cache (OPTIMIZED)
+# vmnic -> dvSwitch list
+# ============================================================
+
+$vmnicToDvMap = @{}
+$allDvSwitches = @()
+
+if ($vcConnection) {
+    $allDvSwitches = Get-VDSwitch -Server $vcConnection
+}
+
+foreach ($dv in $allDvSwitches) {
+
+    $uplinkGroups = Get-VDPortgroup -VDSwitch $dv | Where-Object { $_.IsUplink }
+
+    foreach ($pg in $uplinkGroups) {
+
+        $ports = Get-VDPort -VDPortgroup $pg -ErrorAction SilentlyContinue |
+        Where-Object { $_.ConnectedEntity }
+
+        foreach ($port in $ports) {
+
+            $vmnic = $port.ConnectedEntity.ExtensionData.Device
+
+            if (-not $vmnicToDvMap.ContainsKey($vmnic)) {
+                $vmnicToDvMap[$vmnic] = New-Object 'System.Collections.Generic.HashSet[string]'
+            }
+
+            [void]$vmnicToDvMap[$vmnic].Add($dv.Name)
+        }
+    }
+}
+
+foreach ($pnic in $physicalNics) {
+    if (-not $pnic.Name -or $pnic.Name -notmatch '^vmnic\d+$') {
+        continue
+    }
+    $vmnicName = $pnic.Name
+
+    if (-not $vmnicToDvMap.ContainsKey($vmnicName)) {
+        continue
+    }
+
+    foreach ($dvName in $vmnicToDvMap[$vmnicName]) {
+
+        $dataPnics += [pscustomobject]@{
+            Host    = $inputHostName
+            Pnic    = $pnic
+            VSwitch = $dvName
+            IP      = ""
+        }
+    }
+}
+
 foreach ($inputHostName in $esxiHostNames) {
     $hostTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -464,41 +548,35 @@ foreach ($inputHostName in $esxiHostNames) {
         }
 
         # ============================================================
-        # dvSwitch handling (unchanged logic)
+        # dvSwitch handling (FINAL FIXED VERSION)
         # ============================================================
-        try {
-            $dvSwitches = Get-VDSwitch -VMHost $vmHost
-        }
-        catch {
-            $dvSwitches = @()
-        }
+        $seenVmnic = @{}
+        foreach ($pnic in $physicalNics) {
 
-        foreach ($dvSwitch in $dvSwitches) {
-            $seenVmnic = @{}
+            $vmnicName = $pnic.Name
 
-            foreach ($uplinkPg in Get-VDPortgroup -VDSwitch $dvSwitch | Where-Object { $_.IsUplink }) {
-                $dvPorts = Get-VDPort -VDPortgroup $uplinkPg -ErrorAction SilentlyContinue |
-                Where-Object { $_.ConnectedEntity -and $_.ConnectedEntity.ExtensionData.Device }
+            # 没有映射直接跳过
+            if (-not $vmnicToDvMap.ContainsKey($vmnicName)) {
+                continue
+            }
 
-                foreach ($dvPort in $dvPorts) {
-                    $vmnicName = $dvPort.ConnectedEntity.ExtensionData.Device
-                    if ($seenVmnic[$vmnicName]) { continue }
-                    $seenVmnic[$vmnicName] = $true
+            foreach ($dvName in $vmnicToDvMap[$vmnicName]) {
 
-                    $pnic = $physicalNics | Where-Object { $_.Name -eq $vmnicName } | Select-Object -First 1
-                    if (-not $pnic) { continue }
+                # ❗ 用 HashSet 做 host-level 去重（必须加）
+                $uniqueKey = "$vmnicName|$dvName"
 
-                    if (($mgtPnics + $dataPnics) | Where-Object { $_.Pnic.Name -eq $pnic.Name }) { continue }
-
+                if (-not $seenVmnic.ContainsKey($uniqueKey)) {
+                    $seenVmnic[$uniqueKey] = $true 
                     $dataPnics += [pscustomobject]@{
                         Host    = $inputHostName
                         Pnic    = $pnic
-                        VSwitch = $dvSwitch.Name
+                        VSwitch = $dvName
                         IP      = ""
                     }
                 }
             }
         }
+
 
         # ============================================================
         # CSV output (DATA + MGT)
@@ -506,33 +584,33 @@ foreach ($inputHostName in $esxiHostNames) {
         $dataIndex = 0
         foreach ($entry in $dataPnics | Sort-Object $nicSortDefinition) {
             $dataIndex++
-            Convert-ToCsvSafe @(
-                $entry.Host,
-                "DATA$dataIndex",
-                $entry.Pnic.Name,
-                $entry.VSwitch,
-                $entry.IP,
-                $entry.Pnic.Mac,
-                (Get-PnicPortType -Pnic $entry.Pnic)
-            ) | Out-File $outputCsv -Append -Encoding UTF8
+            $csvBuffer.Add((Convert-ToCsvSafe @(
+                        $entry.Host,
+                        "DATA$dataIndex",
+                        $entry.Pnic.Name,
+                        $entry.VSwitch,
+                        $entry.IP,
+                        $entry.Pnic.Mac,
+                        (Get-PnicPortType -Pnic $entry.Pnic)
+                    ) ))
         }
 
         $mgtIndex = 0
         foreach ($entry in $mgtPnics | Sort-Object $nicSortDefinition) {
             $mgtIndex++
-            Convert-ToCsvSafe @(
-                $entry.Host,
-                "MGT$mgtIndex",
-                $entry.Pnic.Name,
-                $entry.VSwitch,
-                $entry.IP,
-                $entry.Pnic.Mac,
-                (Get-PnicPortType -Pnic $entry.Pnic)
-            ) | Out-File $outputCsv -Append -Encoding UTF8
+            $csvBuffer.Add((Convert-ToCsvSafe @(
+                        $entry.Host,
+                        "MGT$mgtIndex",
+                        $entry.Pnic.Name,
+                        $entry.VSwitch,
+                        $entry.IP,
+                        $entry.Pnic.Mac,
+                        (Get-PnicPortType -Pnic $entry.Pnic)
+                    )))
         }
 
         if ($hostContext.Mode -eq "Direct") {
-            Disconnect-VIServer $hostContext.Server -Confirm:$false | Out-Null
+            Disconnect-VIServer -Server $hostContext.Server -Confirm:$false | Out-Null
         }
 
         $hostTimer.Stop()
@@ -586,6 +664,8 @@ Write-Host (
     "Average per-host execution time: {0:N0} ms" -f
     $avgMs
 ) -ForegroundColor Green
+
+$csvBuffer | Out-File $outputCsv -Encoding UTF8
 
 Invoke-Item $outputCsv
 
