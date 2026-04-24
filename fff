@@ -1,0 +1,596 @@
+Clear-Host
+# ============================================================
+# PowerCLI initialization
+# ============================================================
+$env:POWERCLI_SKIP_REENTRANT_SERVER_LIST = "1"
+Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Read-CredentialInteractive {
+    param(
+        [string]$TargetName
+    )
+
+    Write-Host ""
+    Write-Host ("[CREDENTIAL] Enter credentials for {0}" -f $TargetName) -ForegroundColor Yellow
+
+    $username = Read-Host "Username"
+    $password = Read-Host "Password" -AsSecureString
+
+    if (-not $username -or -not $password) {
+        return $null
+    }
+    return New-Object PSCredential ($username, $password)
+}
+
+# ============================================================
+# vCenter connection information
+# ============================================================
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Enter vCenter Server hostname or IP (leave blank to skip vCenter): " -ForegroundColor DarkYellow -NoNewline
+$vCenterServer = Read-Host
+$vCenterCredential = $null
+
+if ($vCenterServer) {
+    Write-Host ""
+    Write-Host "NOTE: You may be prompted to enter credentials for vCenter and/or direct ESXi access." -ForegroundColor Yellow
+    Write-Host "      These credentials are required to support phased data collection and to minimize repeated authentication prompts during execution." -ForegroundColor Yellow
+    $vCenterCredential = Read-CredentialInteractive "vCenter"
+}
+
+# ============================================================
+# Cache ESXi Direct credential at startup (optional later use)
+# ============================================================
+
+# ============================================================
+# Credential Pool (Interactive, secure, no hardcode)
+# ============================================================
+$CredentialPool = @()
+
+Write-Host ""
+Write-Host "[CREDENTIAL POOL] Enter ESXi credentials (leave username empty to finish)" -ForegroundColor Yellow
+
+while ($true) {
+    $cred = Read-CredentialInteractive "ESXi"
+    if (-not $cred) { break }
+    $CredentialPool += $cred
+}
+
+if (-not $CredentialPool -or $CredentialPool.Count -eq 0) {
+    Write-Host "No credentials provided. Script cannot continue." -ForegroundColor Red
+    exit
+}
+
+# 成功凭证缓存（Host -> Credential）
+$SuccessCredentialMap = @{}
+
+# ============================================================
+# Output paths
+# ============================================================
+$timestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+$scriptDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { (Get-Location).Path }
+
+$esxiListFile = Join-Path $scriptDir "ESXiHosts.txt"
+$outputCsv = Join-Path $scriptDir ("Output\ESXi_Host_Inventory_{0}.csv" -f $timestamp)
+$statusLog = Join-Path $scriptDir ("ESXi_Connection_Status_{0}.log" -f $timestamp)
+
+"Hostname,Mode,Result" | Out-File $statusLog -Encoding UTF8
+
+# ============================================================
+# Read ESXi host list
+# ============================================================
+$esxiHostNames = Get-Content $esxiListFile |
+Where-Object { $_ -and $_.Trim() -ne "" -and -not $_.Trim().StartsWith("#") } |
+ForEach-Object { $_.Trim() } |
+Select-Object -Unique
+
+# ============================================================
+# Start Timer
+# ============================================================
+
+$globalExecutionTimer = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Write-Status {
+    param(
+        [string]$HostName,
+        [string]$Mode,
+        [string]$Result
+    )
+    Add-Content -Path $statusLog -Value "$HostName,$Mode,$Result"
+}
+
+# ============================================================
+# Connect to vCenter
+# ============================================================
+
+$vcConnection = $null
+
+if ($vCenterServer) {
+    Write-Host ""
+    try {
+        $vcConnection = Connect-VIServer `
+            -Server $vCenterServer `
+            -Credential $vCenterCredential `
+            -ErrorAction Stop
+        Write-Host ("[SUCCESS] Connected to vCenter: {0}" -f $vcConnection.Name) -ForegroundColor Green
+        $script:vcDnsDomain = ($vcConnection.Name -split '\.', 2)[1]
+    }
+    catch {
+        Write-Host ("[INFO] vCenter connection to '{0}' failed. ESXi Direct mode will be used." -f $vCenterServer
+        ) -ForegroundColor DarkYellow
+    }
+}
+else {
+    Write-Host "[INFO] vCenter address not provided. ESXi Direct mode only." -ForegroundColor DarkYellow
+}
+
+$vmHostMap = @{}
+
+if ($vcConnection) {
+    Write-Host ""
+    Write-Host "Caching vCenter inventory..." -ForegroundColor Gray -NoNewline
+
+    $allHosts = Get-VMHost -Server $vcConnection
+
+    foreach ($h in $allHosts) {
+        $vmHostMap[$h.Name.ToLower()] = $h
+    }
+}
+
+# ============================================================
+# Direct ESXi connection
+# ============================================================
+function Connect-EsxiDirect {
+    param (
+        [string]$HostName
+    )
+
+    # 使用本地副本，避免污染全局变量
+    $localPool = $CredentialPool
+
+    if ($SuccessCredentialMap[$HostName]) {
+        $localPool = @($SuccessCredentialMap[$HostName]) + $CredentialPool
+    }
+
+    foreach ($cred in $localPool) {
+        try {
+            $connection = Connect-VIServer `
+                -Server $HostName `
+                -Credential $cred `
+                -ErrorAction Stop
+
+            $vmHost = Get-VMHost -Server $connection
+
+            # 记录成功凭证
+            $SuccessCredentialMap[$HostName] = $cred
+
+            Write-Host "Direct connection success (Credential: $($cred.UserName))" -ForegroundColor Cyan
+
+            return [pscustomobject]@{
+                Success = $true
+                Mode    = "Direct"
+                Server  = $connection
+                VMHost  = $vmHost
+            }
+        }
+        catch {
+            Write-Host "Credential failed: $($cred.UserName)" -ForegroundColor DarkYellow
+        }
+    }
+
+    return [pscustomobject]@{
+        Success = $false
+        Reason  = "AUTH_FAILED"
+    }
+}
+# ============================================================
+# Pre-connectivity check for ESXi host
+# ============================================================
+function Test-EsxiFast {
+    param(
+        [string]$HostName,
+        [int]$TimeoutMs = 1200
+    )
+
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect($HostName, 443, $null, $null)
+
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+            $client.Close()
+            return $false
+        }
+
+        $client.EndConnect($iar)
+        $client.Close()
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+# ============================================================
+# Resolve ESXi host (vCenter first, then direct)
+# NOTE:
+# Fast-path assumes ESXi hosts share DNS domain with vCenter.
+# Slow fallback handles non-uniform environments.
+# ============================================================
+function Resolve-EsxiHost {
+    param([string]$HostName)
+
+    if (-not $vcConnection) { return $null }
+
+    $key = $HostName.ToLower()
+
+    if ($vmHostMap.ContainsKey($key)) {
+        return $vmHostMap[$key]
+    }
+
+    if ($HostName -notmatch '\.' -and $script:vcDnsDomain) {
+        $fqdn = "$HostName.$script:vcDnsDomain".ToLower()
+        if ($vmHostMap.ContainsKey($fqdn)) {
+            return $vmHostMap[$fqdn]
+        }
+    }
+
+    return $null
+}
+
+function Convert-ToCsvSafe {
+    param([string[]]$Fields)
+    return ($Fields | ForEach-Object {
+            '"' + ($_ -replace '"', '""') + '"'
+        }) -join ","
+}
+
+function Get-PnicPortType {
+    param (
+        [Parameter(Mandatory)]
+        $Pnic
+    )
+    $portType = "UNKNOWN"
+    if ($Pnic -and $Pnic.ExtensionData -and $Pnic.ExtensionData.ValidLinkSpecification) {
+        # 取所有 Full-Duplex 的速率
+        $maxSpeedMb = (
+            $Pnic.ExtensionData.ValidLinkSpecification |
+            Where-Object { $_.Duplex -eq $true } |
+            Select-Object -ExpandProperty SpeedMb |
+            Measure-Object -Maximum
+        ).Maximum
+
+        if ($maxSpeedMb) {
+            switch ($maxSpeedMb) {
+                { $_ -ge 100000 } { $portType = "100G"; break }
+                { $_ -ge 40000 } { $portType = "40G"; break }
+                { $_ -ge 25000 } { $portType = "25G"; break }
+                { $_ -ge 10000 } { $portType = "TenG"; break }
+                1000 { $portType = "GE"; break }
+                100 { $portType = "FE"; break }
+            }
+        }
+    }
+    return $portType
+}
+
+# ============================================================
+# CSV header
+# ============================================================
+$csvHeaders = @("Host", "Port", "NIC", "Bonding", "IP", "MAC", "PortType")
+($csvHeaders -join ",") | Out-File -FilePath $outputCsv -Encoding UTF8
+
+# ============================================================
+# Main logic
+# ============================================================
+
+# ============================================================
+# NIC sorting definition (used by both MGT and DATA paths)
+# ============================================================
+$nicSortDefinition = @(
+    @{ Expression = { $_.VSwitch } },
+    @{ Expression = { if ($_.Pnic.Name -match '^vmnic\d+$') { 0 } else { 1 } } },
+    @{ Expression = {
+            if ($_.Pnic.Name -match '^vmnic(\d+)$') {
+                [int]$matches[1]
+            }
+            else {
+                [int]::MaxValue
+            }
+        }
+    }
+)
+
+$preCheckMap = @{}
+
+foreach ($hostName in $esxiHostNames) {
+
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect($hostName, 443, $null, $null)
+
+        $ok = $iar.AsyncWaitHandle.WaitOne(1200, $false)
+        $client.Close()
+    }
+    catch {
+        $ok = $false
+    }
+
+    $preCheckMap[$hostName.ToLower()] = $ok
+}
+
+Write-Host "Done" -ForegroundColor Green
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+
+$esxiCount = $esxiHostNames.Count
+$i = 0
+foreach ($inputHostName in $esxiHostNames) {
+    $hostTimer = [System.Diagnostics.Stopwatch]::StartNew()
+
+    $i++
+    Write-Host ""
+    Write-Host "($i/$esxiCount) Processing ESXi Host: $inputHostName" -ForegroundColor Cyan
+
+    $hostContext = $null
+
+    try {
+        # ============================================================
+        # ① PreCheck FIRST（避免无效 vCenter 查询）
+        # ============================================================
+        if (-not $preCheckMap[$inputHostName.ToLower()]) {
+
+            Write-Host "TCP 443 unreachable: skip" -ForegroundColor DarkYellow
+
+            Write-Status `
+                -HostName $inputHostName `
+                -Mode "PreCheck" `
+                -Result "TCP_FAILED"
+
+            continue
+        }
+
+        # ============================================================
+        # ② vCenter resolve（现在是 O(1)）
+        # ============================================================
+        if ($vcConnection) {
+            $vmHost = Resolve-EsxiHost $inputHostName
+
+            if ($vmHost) {
+                Write-Host "Found in vCenter: $($vcConnection.Name)" -ForegroundColor Cyan
+
+                $hostContext = [pscustomobject]@{
+                    Success = $true
+                    Mode    = "vCenter"
+                    Server  = $vcConnection
+                    VMHost  = $vmHost
+                }
+            }
+        }
+
+        # ============================================================
+        # ③ NOT in vCenter: Direct
+        # ============================================================
+        if (-not $hostContext) {
+
+            Write-Host "Not found in vCenter: Direct connect" -ForegroundColor Yellow
+
+            $hostContext = Connect-EsxiDirect $inputHostName
+
+            if (-not $hostContext -or -not $hostContext.Success) {
+
+                Write-Host "Direct connection failed" -ForegroundColor Red
+
+                Write-Status `
+                    -HostName $inputHostName `
+                    -Mode "Direct" `
+                    -Result "FAILED"
+
+                continue
+            }
+        }
+
+        # ============================================================
+        # ③ At this point, VMHost is guaranteed
+        # ============================================================
+        $vmHost = $hostContext.VMHost
+
+        # ------------------------------------------------------------
+        # VMHost state validation (CRITICAL)
+        # ------------------------------------------------------------
+        
+        if ($vmHost.ConnectionState -notin @("Connected", "Maintenance")) {
+            Write-Host ("Host {0} is in state '{1}'. Skipping host-level network inventory." `
+                    -f $vmHost.Name, $vmHost.ConnectionState) -ForegroundColor DarkYellow
+
+            # ✅ 记录为 PARTIAL，而不是 FAILED
+            Write-Status `
+                -HostName $inputHostName `
+                -Mode $hostContext.Mode `
+                -Result "PARTIAL_$($vmHost.ConnectionState)"
+            continue
+        }
+
+        $dataPnics = @()
+        $mgtPnics = @()
+
+        $vmkernelAdapters = Get-VMHostNetworkAdapter -VMHost $vmHost -VMKernel -ErrorAction SilentlyContinue
+        $managementVmks = $vmkernelAdapters | Where-Object { $_.ManagementTrafficEnabled }
+
+        $managementPortGroups = $managementVmks |
+        Select-Object -ExpandProperty PortGroupName -Unique
+
+        $standardPortGroups = Get-VirtualPortGroup -VMHost $vmHost -Standard
+
+        $managementVSwitchNames = @()
+        foreach ($pgName in $managementPortGroups) {
+            $pg = $standardPortGroups | Where-Object { $_.Name -eq $pgName } | Select-Object -First 1
+            if ($pg) { $managementVSwitchNames += $pg.VirtualSwitchName }
+        }
+        $managementVSwitchNames = $managementVSwitchNames | Select-Object -Unique
+
+        # --- Map vSwitch: Management IP ---
+        $vSwitchIpMap = @{}
+        foreach ($vmk in $managementVmks) {
+            if ($vmk.IP) {
+                $pg = $standardPortGroups |
+                Where-Object { $_.Name -eq $vmk.PortGroupName } |
+                Select-Object -First 1
+                if ($pg) { $vSwitchIpMap[$pg.VirtualSwitchName] = $vmk.IP }
+            }
+        }
+
+        $standardVSwitches = Get-VirtualSwitch -VMHost $vmHost -Standard
+        $physicalNics = Get-VMHostNetworkAdapter -VMHost $vmHost -Physical
+        
+
+        foreach ($vSwitch in $standardVSwitches) {
+            foreach ($pnic in $physicalNics | Where-Object { $vSwitch.Nic -contains $_.Name }) {
+
+                $entry = [pscustomobject]@{
+                    Host    = $inputHostName
+                    Pnic    = $pnic
+                    VSwitch = $vSwitch.Name
+                    IP      = $vSwitchIpMap[$vSwitch.Name]
+                }
+
+                if ($managementVSwitchNames -contains $vSwitch.Name) {
+                    $mgtPnics += $entry
+                }
+                else {
+                    $dataPnics += $entry
+                }
+            }
+        }
+
+        # ============================================================
+        # dvSwitch handling (unchanged logic)
+        # ============================================================
+        try {
+            $dvSwitches = Get-VDSwitch -VMHost $vmHost
+        }
+        catch {
+            $dvSwitches = @()
+        }
+
+        foreach ($dvSwitch in $dvSwitches) {
+            $seenVmnic = @{}
+
+            foreach ($uplinkPg in Get-VDPortgroup -VDSwitch $dvSwitch | Where-Object { $_.IsUplink }) {
+                $dvPorts = Get-VDPort -VDPortgroup $uplinkPg -ErrorAction SilentlyContinue |
+                Where-Object { $_.ConnectedEntity -and $_.ConnectedEntity.ExtensionData.Device }
+
+                foreach ($dvPort in $dvPorts) {
+                    $vmnicName = $dvPort.ConnectedEntity.ExtensionData.Device
+                    if ($seenVmnic[$vmnicName]) { continue }
+                    $seenVmnic[$vmnicName] = $true
+
+                    $pnic = $physicalNics | Where-Object { $_.Name -eq $vmnicName } | Select-Object -First 1
+                    if (-not $pnic) { continue }
+
+                    if (($mgtPnics + $dataPnics) | Where-Object { $_.Pnic.Name -eq $pnic.Name }) { continue }
+
+                    $dataPnics += [pscustomobject]@{
+                        Host    = $inputHostName
+                        Pnic    = $pnic
+                        VSwitch = $dvSwitch.Name
+                        IP      = ""
+                    }
+                }
+            }
+        }
+
+        # ============================================================
+        # CSV output (DATA + MGT)
+        # ============================================================
+        $dataIndex = 0
+        foreach ($entry in $dataPnics | Sort-Object $nicSortDefinition) {
+            $dataIndex++
+            Convert-ToCsvSafe @(
+                $entry.Host,
+                "DATA$dataIndex",
+                $entry.Pnic.Name,
+                $entry.VSwitch,
+                $entry.IP,
+                $entry.Pnic.Mac,
+                (Get-PnicPortType -Pnic $entry.Pnic)
+            ) | Out-File $outputCsv -Append -Encoding UTF8
+        }
+
+        $mgtIndex = 0
+        foreach ($entry in $mgtPnics | Sort-Object $nicSortDefinition) {
+            $mgtIndex++
+            Convert-ToCsvSafe @(
+                $entry.Host,
+                "MGT$mgtIndex",
+                $entry.Pnic.Name,
+                $entry.VSwitch,
+                $entry.IP,
+                $entry.Pnic.Mac,
+                (Get-PnicPortType -Pnic $entry.Pnic)
+            ) | Out-File $outputCsv -Append -Encoding UTF8
+        }
+
+        if ($hostContext.Mode -eq "Direct") {
+            Disconnect-VIServer $hostContext.Server -Confirm:$false | Out-Null
+        }
+
+        $hostTimer.Stop()
+
+        # 计算一个人类可读的时间字符串
+        $elapsedText = if ($hostTimer.Elapsed.TotalSeconds -ge 1) {
+            "{0:N1}s" -f $hostTimer.Elapsed.TotalSeconds
+        }
+        else {
+            "{0:N0}ms" -f $hostTimer.Elapsed.TotalMilliseconds
+        }
+
+        $color = if ($hostTimer.Elapsed.TotalSeconds -gt 10) {
+            'Red'
+        }
+        else {
+            'Green'
+        }
+
+        Write-Host (
+            "[DONE] {0} (Elapsed: {1})" -f $inputHostName, $elapsedText
+        ) -ForegroundColor $color
+
+        # 记录每台 Host 的耗时（毫秒）
+        Write-Status `
+            -HostName $inputHostName `
+            -Mode $hostContext.Mode `
+            -Result ("ElapsedMs={0}" -f $hostTimer.ElapsedMilliseconds)
+
+    }
+    finally {
+        Write-Host ""
+        Write-Host "============================================================" -ForegroundColor Cyan
+    }
+}
+
+# Stop Timer
+$globalExecutionTimer.Stop()
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+
+Write-Host (
+    "Total execution time (excluding interaction): {0:N2} seconds" -f
+    $globalExecutionTimer.Elapsed.TotalSeconds
+) -ForegroundColor Green
+
+$avgMs = $globalExecutionTimer.Elapsed.TotalMilliseconds / $esxiHostNames.Count
+
+Write-Host (
+    "Average per-host execution time: {0:N0} ms" -f
+    $avgMs
+) -ForegroundColor Green
+
+Invoke-Item $outputCsv
+
+Write-Host ""
+if ($Host.Name -eq 'ConsoleHost') {
+    Write-Host "Script execution completed. Press any key to exit..."
+    [System.Console]::ReadKey($true) | Out-Null
+}
